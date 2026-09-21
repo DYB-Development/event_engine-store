@@ -27,4 +27,9 @@ Gem::Specification.new do |spec|
   spec.add_dependency "railties", ">= 7.1.6", "< 9"
   spec.add_dependency "activerecord", ">= 7.1.6", "< 9"
   spec.add_dependency "event_engine", ">= 0.2.1"
+
+  # json 3 dropped the second argument ActiveSupport::JSON.decode passes it, so
+  # every read of a json column raises until Rails ships a release that calls
+  # the new interface.
+  spec.add_dependency "json", "< 3"
 end
