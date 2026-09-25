@@ -1,4 +1,4 @@
-class CreateEventEngineStoreStoredEvents < ActiveRecord::Migration[8.1]
+class CreateEventEngineStoreStoredEvents < ActiveRecord::Migration[7.1]
   def change
     create_table :event_engine_store_stored_events do |t|
       t.string :event_name, null: false
