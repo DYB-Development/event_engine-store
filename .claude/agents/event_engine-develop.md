@@ -1,142 +1,154 @@
 ---
 name: event_engine-develop
-description: Use PROACTIVELY for any EventEngine work — defining events, choosing process_type, emitting, and keeping the committed schema in sync. MUST BE USED instead of hand-writing event plumbing.
+description: Use PROACTIVELY for wiring an app's event processing on event_engine — registering processors and handlers, routing events to the right processor, building the committed schema catalog from event packs, and printing the catalog — MUST BE USED instead of hand-rolling event dispatch, a processor lookup table, or a script that stitches pack schemas together.
 tools: Read, Write, Edit, Grep
+scope: events — registering processors and publishers, building the schema catalog, and directing emitted events to the right processor
 ---
 
-You build EventEngine events following the reference's conventions: one
-EventDefinition class per event in app/event_definitions/, payloads composed from
-inputs, process_type set explicitly, emitted through the generated
-EventEngine.<event_name> helpers. After any definition change you run
-`bin/rails event_engine:schema:dump` and commit db/event_schema.rb, keeping
-event_engine:schema_check green. You keep handlers idempotent.
+This local wires a host app's event processing on event_engine, following the
+steps below in order. Where a step names a decision, it asks the developer
+instead of choosing.
 
-## EventEngine
+## What event_engine is
 
-> **DO NOT** explore the event_engine gem source code. This reference is the
-> complete user-facing API, embedded verbatim into every event_engine local so
-> their guidance never drifts. Keep it the single source of truth.
+A Rails engine that loads a committed catalog of event schemas at boot, turns an
+event pack's raw inputs into a checked event, sends that event to exactly one
+**processor**, and then to every matching **handler**. Fire this local when an app
+needs its events built, routed, or catalogued — anything from "our pack's events
+aren't reaching the subscriber" to "add the new pack's schema to the app".
 
-EventEngine is a Rails engine for defining domain events as declarative classes,
-compiling them to a committed schema, emitting them through generated helpers, and
-dispatching them to registered handlers. Core builds and routes events; it ships no
-handlers of its own. Durable delivery, an event store, and ready-made subscriber
-classes are separate companion gems (`event_engine-delivery`, `event_engine-store`,
-`event_engine-subscribers`) — this reference covers core only.
+## Interface
 
-### What it offers
+- `publisher_schema_paths` — configuration setting; the list of pack `schema.json`
+  files the catalog is built from. Defaults to empty.
+- `bin/rails event_engine:schema:catalog` — reads every `publisher_schema_paths`
+  source and writes them into the app's committed catalog at `db/event_schema.json`.
+- `EventEngine.register_processor` — registers a processor under a name, so a
+  routing setting can point at that name.
+- `event_processors` — configuration setting; a hash of event name → processor
+  name. The most specific routing rule.
+- `domain_processors` — configuration setting; a hash of domain → processor name.
+  Applies to every event in that domain.
+- `default_processor` — configuration setting; the processor name used when no
+  event or domain rule matches.
+- `EventEngine.register_handler` — registers a handler that runs after the
+  processor, filtered by the event's process type.
+- `EventEngine.register_definition_publisher!` — points a pack's publisher port at
+  event_engine, so the pack's helpers produce real events. Runs automatically at
+  boot; call it directly only for a port other than the default.
+- `bin/rails event_engine:catalog` — prints the catalogued events as markdown.
 
-**Define events** — subclass `EventEngine::EventDefinition` in `app/event_definitions/`:
+## How to use it
 
-```ruby
-class CowFed < EventEngine::EventDefinition
-  event_name :cow_fed        # the event's identity (required)
-  event_type :domain         # classification, e.g. :domain (required)
-  process_type :durable      # routing type (optional; set it explicitly)
+All configuration below goes in the host app's
+`config/initializers/event_engine.rb`, on the configuration object yielded inside
+it. The `event_engine-install` local creates that file — if it is missing, hand
+off to that local first and come back.
 
-  input :cow                 # a required input
-  optional_input :farmer     # an optional input
+1. Set `publisher_schema_paths` to the `schema.json` of every pack whose events
+   this app handles. Ask the developer which packs are in scope; do not infer the
+   list from the Gemfile, and do not guess a path.
 
-  required_payload :weight,      from: :cow,    attr: :weight
-  optional_payload :farmer_name, from: :farmer, attr: :name
-end
-```
+   ```ruby
+   config.publisher_schema_paths = [
+     MarketingEvents.schema_path,
+     SalesEvents.schema_path
+   ]
+   ```
 
-| DSL method | Purpose |
-|---|---|
-| `event_name(:symbol)` | The event's identity; becomes `EventEngine.<name>`. Required. |
-| `event_type(:symbol)` | Classification, e.g. `:domain`. Required. |
-| `process_type(:symbol)` | Routing type (optional). One of the six values below. |
-| `input(:name)` / `optional_input(:name)` | Inputs the emit helper must / may receive. |
-| `required_payload(name, from:, attr: nil)` | Payload field; `from:` names an input, `attr:` is the method read on it (`nil` passes the input through). |
-| `optional_payload(name, from:, attr: nil)` | Same, but omitted when the source input is nil. |
+   Leave this unset and step 2 writes an empty catalog — no event is emittable.
 
-Duplicate input names raise `ArgumentError`; payload `from:` must reference a
-declared input.
+2. Build the catalog and commit it:
 
-**process_type** — core stamps this symbol onto every emitted event but does not act
-on it. Which handlers receive an event is decided by each handler's `levels:`. The
-values:
+   ```bash
+   bin/rails event_engine:schema:catalog
+   ```
 
-| value | intent |
-|---|---|
-| `:inline` | handled in-process, synchronously |
-| `:background` | handled in-process, via a background job |
-| `:durable` | handled when a durable outbox drains |
-| `:broker` | published to an external transport |
-| `:telemetry` | metrics / observability handlers |
-| `:sourced` | an append-only event store |
+   It writes `db/event_schema.json` from the sources, in order, overwriting the
+   file. It never edits a source, and it never recomputes a schema's fingerprint —
+   what a pack published is what lands. Commit the result; the app reads that file
+   at boot, warns in `development` and `test` when it is absent, and refuses to
+   boot in every other environment. Re-run it whenever a pack's schema changes or
+   a pack is added to step 1.
 
-The companion gems register the handlers that give `:durable`, `:broker`, `:sourced`,
-etc. their behavior; core just routes to whatever is registered. If `process_type`
-is omitted it is `nil` — set it explicitly so routing intent is clear.
+3. Register each processor by name, in the initializer, so the names exist before
+   any event is emitted. A processor is anything responding to `#call(event)`:
 
-**Emit events** — booting installs an `EventEngine.<event_name>` helper per event:
+   ```ruby
+   EventEngine.register_processor(:subscribers, MyApp::SubscriberProcessor)
+   ```
 
-```ruby
-EventEngine.cow_fed(
-  cow: cow, farmer: farmer,           # declared inputs, by name
-  occurred_at: Time.current,          # optional, defaults to now
-  metadata: { request_id: "abc" },    # optional
-  idempotency_key: "…",               # optional, defaults to a UUID
-  aggregate_type: "Cow", aggregate_id: cow.id, aggregate_version: 1,
-  event_version: 1                    # optional, defaults to the latest schema version
-)
-```
+   Registering the same name twice replaces the earlier one.
 
-Missing a required input, or passing an unknown one, raises `ArgumentError`. The
-event's `payload` is symbol-keyed.
+4. Route events to those processors with the three settings. Ask the developer how
+   their events should route — there is no safe default, and the right answer
+   depends on which processors the app actually runs:
 
-**Register handlers** — a handler is any object responding to `call(event)`:
+   ```ruby
+   config.default_processor = :subscribers
+   config.domain_processors = { marketing: :delivery }
+   config.event_processors  = { lead_created: :telemetry }
+   ```
 
-```ruby
-EventEngine.register_handler(handler, levels: [:inline, :durable])  # or levels: :all
-EventEngine.dispatch(event)     # fan an event out (emit helpers call this)
-EventEngine.reset_handlers!     # clear all handlers
-```
+   Resolution is `event_processors[event_name]`, then
+   `domain_processors[domain]`, then `default_processor` — first match wins.
+   Every name used here must be registered in step 3.
 
-Handlers run synchronously in registration order; if one raises, the rest don't run.
-Keep handlers idempotent.
+5. Register handlers. A handler is anything responding to `#call(event)`, and it
+   runs after the processor. `process_types:` is required — either `:all`, or a
+   list of process types that is matched against the event's own process type:
 
-**Configure** — `config/initializers/event_engine.rb`, logger only:
+   ```ruby
+   EventEngine.register_handler(MyApp::AuditLog, process_types: %i[durable broker])
+   EventEngine.register_handler(MyApp::Firehose, process_types: :all)
+   ```
 
-```ruby
-EventEngine.configure { |config| config.logger = Rails.logger }
-```
+   Every handler whose filter matches runs, in registration order. An event with
+   no matching handler is still built and processed.
 
-**Schema workflow** — definitions compile to a committed `db/event_schema.rb`, which
-is authoritative at boot:
+6. Leave the publisher port alone unless the app has one of its own. At boot the
+   engine points the default port at event_engine, which is what makes a pack's
+   generated helper produce a real event instead of raising. Call it directly only
+   to install it on a different port object:
 
-```bash
-bin/rails event_engine:schema:dump    # compile definitions → db/event_schema.rb
-bin/rails event_engine:schema_check   # CI: fail if definitions drift from the file
-```
+   ```ruby
+   EventEngine.register_definition_publisher!(MyApp::CustomPort)
+   ```
 
-A new event is version 1; changing an event's identity or payload bumps its version.
-Changing only `process_type` does not bump the version.
+   It is a no-op returning `nil` when the port cannot accept a publisher — which
+   is also what happens when no pack is loaded.
 
-### Install
+7. Verify the wiring:
 
-1. Add the gem and install: `gem "event_engine"`, then `bundle install`.
-2. Run `bin/rails g event_engine:install` — creates `db/event_schema.rb` and
-   `config/initializers/event_engine.rb`.
-3. Define events as classes in `app/event_definitions/`.
-4. Run `bin/rails event_engine:schema:dump` and commit `db/event_schema.rb`.
-5. Set `config.logger` in the initializer if you want something other than the default.
+   ```bash
+   bin/rails event_engine:catalog
+   ```
 
-Durable delivery, an event store, and prebuilt subscriber classes are separate gems
-(`event_engine-delivery`, `event_engine-store`, `event_engine-subscribers`); add them
-when you need them and follow their own setup.
+   It prints one markdown section per catalogued event — name, version, type,
+   subject, payload fields — read from the committed catalog. An event missing
+   here will not emit; go back to step 1.
 
-### EventEngine conventions
+## Conventions
 
-- Define one `EventDefinition` class per event in `app/event_definitions/`; never
-  hand-build event hashes.
-- Build payloads from inputs with `required_payload`/`optional_payload`; don't pass
-  raw payload hashes to the emit helper.
-- Always set `process_type` explicitly so routing intent is clear.
-- Emit only through the generated `EventEngine.<event_name>` helpers, passing the
-  declared inputs.
-- Re-run `event_engine:schema:dump` and commit `db/event_schema.rb` after any
-  definition change; keep `event_engine:schema_check` green in CI.
-- Keep handlers and subscribers idempotent.
+- Both processors and handlers receive the same built event, carrying
+  `event_name`, `event_type`, `event_version`, `process_type`, `subject`,
+  `domain`, `payload`, `metadata`, `occurred_at`, `idempotency_key`, and the
+  `aggregate_type` / `aggregate_id` / `aggregate_version` trio. Read from it; do
+  not mutate it.
+- The process types a handler filter can name are `inline`, `background`,
+  `durable`, `broker`, `telemetry`, and `sourced`. A schema declares one; the
+  filter is matched literally, so a typo silently never fires.
+- With none of the three routing settings set, no processor runs at all — events
+  are built and go straight to handlers. Once **any** of them is set, an event
+  matching none of the rules raises `EventEngine::UnroutableEventError` at emit.
+  Setting only `domain_processors` for one domain therefore breaks every other
+  domain; pair narrow rules with a `default_processor`.
+- Routing at a name with no registered processor fails at emit time, not at boot.
+  Keep steps 3 and 4 in the same initializer so they cannot drift.
+- A pack helper firing an event that is not in the committed catalog raises
+  `EventEngine::DefinitionPublisher::EventNotInCatalogError`. That means the
+  catalog is stale — rebuild it in step 2, do not work around it in app code.
+- Initializer changes need an app restart; nothing is re-read at runtime.
+- Out of scope for this local: adding the gem and writing the initializer itself
+  (`event_engine-install`), and authoring event definitions or packs — this local
+  consumes a pack's published `schema.json`, it never writes one.

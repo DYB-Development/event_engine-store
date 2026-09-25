@@ -1,0 +1,22 @@
+scope: event store — recording every dispatched event to an append-only table, replaying the log in order, and rebuilding projections from it
+
+install:
+  - bin/rails event_engine_store:install:migrations
+
+develop:
+  - EventEngine::Store::StoredEvent
+  - EventEngine::Store::Replay.each
+  - EventEngine::Store.register_projection
+  - EventEngine::Store.rebuild
+  - EventEngine::Store.projections
+  - EventEngine::Store.reset_projections!
+  - EventEngine::Store::Recorder
+
+sources:
+  - lib/event_engine/store.rb
+  - lib/event_engine/store/engine.rb
+  - lib/event_engine/store/recorder.rb
+  - lib/event_engine/store/replay.rb
+  - lib/event_engine/store/projection_dispatcher.rb
+  - app/models/event_engine/store/stored_event.rb
+  - db/migrate/20260605000001_create_event_engine_store_stored_events.rb

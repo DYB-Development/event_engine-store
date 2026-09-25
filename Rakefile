@@ -7,3 +7,5 @@ require "bundler/gem_tasks"
 
 task test: "app:test"
 task default: :test
+
+require "the_local/rake"

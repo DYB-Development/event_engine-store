@@ -5,7 +5,8 @@ This project has installed expert subagents. Before doing work yourself,
 check whether a local owns it and delegate — never work from memory on
 something a local covers:
 
-- the_local-* agents
+- events — registering processors and publishers, building the schema catalog, and directing emitted events to the right processor → event_engine-* agents
+- resident Claude Code experts — authoring a gem's locals and installing them into a host → the_local-* agents
 
 See each agent's description for specifics.
 <!-- the_local:end -->
