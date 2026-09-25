@@ -1,140 +1,99 @@
 ---
 name: event_engine-install
-description: Use to add EventEngine to a Rails app and set it up correctly.
+description: Use to hook event_engine into a Rails app — adding the gem, writing the `EventEngine.configure` initializer, and getting the boot-time schema catalog in place.
 tools: Bash, Read, Edit
+scope: events — registering processors and publishers, building the schema catalog, and directing emitted events to the right processor
 ---
 
-You install EventEngine following the reference's install section exactly: add the
-gem, bundle, run `bin/rails g event_engine:install`, set the logger in the
-initializer, then dump and commit db/event_schema.rb. You do not invent steps, and
-you do not set up the separate delivery/store/subscribers gems unless asked.
+This local follows the steps below exactly, in order, and invents none. Where a
+step names a decision, it asks the developer instead of choosing.
 
-## EventEngine
+## What event_engine is
 
-> **DO NOT** explore the event_engine gem source code. This reference is the
-> complete user-facing API, embedded verbatim into every event_engine local so
-> their guidance never drifts. Keep it the single source of truth.
+A Rails engine that loads a committed catalog of event schemas at boot so an app
+can emit checked, routed events — hook it in when an app needs its events to be a
+declared, reviewable contract.
 
-EventEngine is a Rails engine for defining domain events as declarative classes,
-compiling them to a committed schema, emitting them through generated helpers, and
-dispatching them to registered handlers. Core builds and routes events; it ships no
-handlers of its own. Durable delivery, an event store, and ready-made subscriber
-classes are separate companion gems (`event_engine-delivery`, `event_engine-store`,
-`event_engine-subscribers`) — this reference covers core only.
+## Interface
 
-### What it offers
+- `EventEngine.configure` — yields the configuration object. The one setup call a
+  host app makes; put it in an initializer so it runs at boot.
 
-**Define events** — subclass `EventEngine::EventDefinition` in `app/event_definitions/`:
+## How to use it
 
-```ruby
-class CowFed < EventEngine::EventDefinition
-  event_name :cow_fed        # the event's identity (required)
-  event_type :domain         # classification, e.g. :domain (required)
-  process_type :durable      # routing type (optional; set it explicitly)
+1. Add the gem to the host app's `Gemfile`:
 
-  input :cow                 # a required input
-  optional_input :farmer     # an optional input
+   ```ruby
+   gem "event_engine"
+   ```
 
-  required_payload :weight,      from: :cow,    attr: :weight
-  optional_payload :farmer_name, from: :farmer, attr: :name
-end
-```
+   Ask the developer whether to take the released gem, pin a version, or track
+   the source repository (`github: "DYB-Development/event_engine"`) — do not pick
+   for them. The host must be a Rails app; this gem is a Rails engine and does
+   nothing outside one.
 
-| DSL method | Purpose |
-|---|---|
-| `event_name(:symbol)` | The event's identity; becomes `EventEngine.<name>`. Required. |
-| `event_type(:symbol)` | Classification, e.g. `:domain`. Required. |
-| `process_type(:symbol)` | Routing type (optional). One of the six values below. |
-| `input(:name)` / `optional_input(:name)` | Inputs the emit helper must / may receive. |
-| `required_payload(name, from:, attr: nil)` | Payload field; `from:` names an input, `attr:` is the method read on it (`nil` passes the input through). |
-| `optional_payload(name, from:, attr: nil)` | Same, but omitted when the source input is nil. |
+2. Install it:
 
-Duplicate input names raise `ArgumentError`; payload `from:` must reference a
-declared input.
+   ```bash
+   bundle install
+   ```
 
-**process_type** — core stamps this symbol onto every emitted event but does not act
-on it. Which handlers receive an event is decided by each handler's `levels:`. The
-values:
+3. Create `config/initializers/event_engine.rb` in the host app:
 
-| value | intent |
-|---|---|
-| `:inline` | handled in-process, synchronously |
-| `:background` | handled in-process, via a background job |
-| `:durable` | handled when a durable outbox drains |
-| `:broker` | published to an external transport |
-| `:telemetry` | metrics / observability handlers |
-| `:sourced` | an append-only event store |
+   ```ruby
+   require "event_engine"
 
-The companion gems register the handlers that give `:durable`, `:broker`, `:sourced`,
-etc. their behavior; core just routes to whatever is registered. If `process_type`
-is omitted it is `nil` — set it explicitly so routing intent is clear.
+   EventEngine.configure do |config|
+   end
+   ```
 
-**Emit events** — booting installs an `EventEngine.<event_name>` helper per event:
+   Every setting is optional — an empty block is a valid install. Steps 4 and 5
+   fill it in.
 
-```ruby
-EventEngine.cow_fed(
-  cow: cow, farmer: farmer,           # declared inputs, by name
-  occurred_at: Time.current,          # optional, defaults to now
-  metadata: { request_id: "abc" },    # optional
-  idempotency_key: "…",               # optional, defaults to a UUID
-  aggregate_type: "Cow", aggregate_id: cow.id, aggregate_version: 1,
-  event_version: 1                    # optional, defaults to the latest schema version
-)
-```
+4. Decide `metadata_defaults` with the developer. It takes a callable returning a
+   hash, invoked on every emit, and its keys are merged **under** any metadata
+   passed at the call site, so the call site wins on a collision. There is no safe
+   default: ask what belongs on every event this app emits (request id, actor,
+   deploy version, …), and leave it unset if the answer is nothing.
 
-Missing a required input, or passing an unknown one, raises `ArgumentError`. The
-event's `payload` is symbol-keyed.
+   ```ruby
+   config.metadata_defaults = -> { { request_id: Current.request_id } }
+   ```
 
-**Register handlers** — a handler is any object responding to `call(event)`:
+   A callable that raises is swallowed and logged rather than breaking the emit.
 
-```ruby
-EventEngine.register_handler(handler, levels: [:inline, :durable])  # or levels: :all
-EventEngine.dispatch(event)     # fan an event out (emit helpers call this)
-EventEngine.reset_handlers!     # clear all handlers
-```
+5. Set `logger` only if the engine's own output should go somewhere other than
+   `Rails.logger` — it defaults to `Rails.logger` inside a Rails app.
 
-Handlers run synchronously in registration order; if one raises, the rest don't run.
-Keep handlers idempotent.
+   ```ruby
+   config.logger = Logger.new("log/event_engine.log")
+   ```
 
-**Configure** — `config/initializers/event_engine.rb`, logger only:
+6. Get the schema catalog to `db/event_schema.json` in the host app and commit it.
+   The engine reads that exact path at boot; the path is fixed and no setting
+   moves it. Without the file, the app logs a warning in `development` and `test`
+   and **refuses to boot in every other environment**. Building the catalog from
+   the app's event packs is the `event_engine-develop` local's job — hand off to
+   it, and confirm the file exists before treating this install as done.
 
-```ruby
-EventEngine.configure { |config| config.logger = Rails.logger }
-```
+7. Verify the app boots with the catalog loaded:
 
-**Schema workflow** — definitions compile to a committed `db/event_schema.rb`, which
-is authoritative at boot:
+   ```bash
+   bin/rails runner 'puts EventEngine.schema_registry.loaded?'
+   ```
 
-```bash
-bin/rails event_engine:schema:dump    # compile definitions → db/event_schema.rb
-bin/rails event_engine:schema_check   # CI: fail if definitions drift from the file
-```
+   `true` means the initializer ran and the catalog was read. `false` means the
+   catalog file is missing — go back to step 6.
 
-A new event is version 1; changing an event's identity or payload bumps its version.
-Changing only `process_type` does not bump the version.
+## Conventions
 
-### Install
-
-1. Add the gem and install: `gem "event_engine"`, then `bundle install`.
-2. Run `bin/rails g event_engine:install` — creates `db/event_schema.rb` and
-   `config/initializers/event_engine.rb`.
-3. Define events as classes in `app/event_definitions/`.
-4. Run `bin/rails event_engine:schema:dump` and commit `db/event_schema.rb`.
-5. Set `config.logger` in the initializer if you want something other than the default.
-
-Durable delivery, an event store, and prebuilt subscriber classes are separate gems
-(`event_engine-delivery`, `event_engine-store`, `event_engine-subscribers`); add them
-when you need them and follow their own setup.
-
-### EventEngine conventions
-
-- Define one `EventDefinition` class per event in `app/event_definitions/`; never
-  hand-build event hashes.
-- Build payloads from inputs with `required_payload`/`optional_payload`; don't pass
-  raw payload hashes to the emit helper.
-- Always set `process_type` explicitly so routing intent is clear.
-- Emit only through the generated `EventEngine.<event_name>` helpers, passing the
-  declared inputs.
-- Re-run `event_engine:schema:dump` and commit `db/event_schema.rb` after any
-  definition change; keep `event_engine:schema_check` green in CI.
-- Keep handlers and subscribers idempotent.
+- The initializer is the only host file this local writes, plus one `Gemfile`
+  line. It creates no migrations and no tables.
+- Re-running any step is safe. Editing the initializer requires an app restart to
+  take effect; nothing re-reads it at runtime.
+- If `db/event_engine_helpers.rb` is present in the host app, the engine loads it
+  at boot. It never creates that file — an event pack commits it. Do not write one.
+- Out of scope for this local: everything an app does *with* the engine —
+  registering processors, publishers or handlers, choosing how events route,
+  pointing the engine at schema sources, emitting events, and the catalog tasks.
+  All of that belongs to `event_engine-develop`.
