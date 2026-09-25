@@ -67,14 +67,14 @@ itself up at boot. Once migrated, every dispatched event is recorded automatical
 
 ## How it hooks into the core
 
-At Rails boot the engine registers **two** handlers with the core, for all levels:
+At Rails boot the engine registers **two** handlers with the core, for every process type:
 
 ```ruby
 # lib/event_engine/store/engine.rb
 initializer "event_engine.store.register_recorder" do
   config.after_initialize do
-    EventEngine.register_handler(Recorder.new, levels: :all)
-    EventEngine.register_handler(ProjectionDispatcher.new, levels: :all)
+    EventEngine.register_handler(Recorder.new, process_types: :all)
+    EventEngine.register_handler(ProjectionDispatcher.new, process_types: :all)
   end
 end
 ```
@@ -85,9 +85,10 @@ So on every `EventEngine.<event>` call:
 2. `ProjectionDispatcher#call(event)` calls `apply(event)` on each registered
    projection.
 
-> Because both register at `levels: :all`, the store records **every** level —
-> including non-durable levels 1 and 2. That's by design: the store is your record of
-> what happened, independent of how it was delivered. If you only want to record some
+> Because both register at `process_types: :all`, the store records events of
+> **every** process type, whichever processor `config/event_rules.yml` routes them to.
+> That's by design: the store is your record of what happened, independent of how it
+> was processed. If you only want to record some
 > events, see [Recording only some events](#recording-only-some-events).
 
 ---
@@ -103,7 +104,7 @@ persisted records), so an attempt to update raises `ActiveRecord::ReadOnlyRecord
 | `event_name` | string | ✓ | NOT NULL |
 | `event_type` | string | | classification |
 | `event_version` | integer | | schema version |
-| `event_level` | integer | | dispatched level |
+| `process_type` | string | | processor the event was routed to |
 | `payload` | json | | event data |
 | `metadata` | json | | context (actor, request id, …) |
 | `occurred_at` | datetime | ✓ | logical event time |
@@ -120,7 +121,7 @@ create_table :event_engine_store_stored_events do |t|
   t.string   :event_name, null: false
   t.string   :event_type
   t.integer  :event_version
-  t.integer  :event_level
+  t.string   :process_type
   t.json     :payload
   t.json     :metadata
   t.datetime :occurred_at
@@ -212,7 +213,7 @@ module EventEngine
           event_name:        event.event_name,
           event_type:        event.event_type,
           event_version:     event.event_version,
-          event_level:       event.event_level,
+          process_type:      event.process_type,
           payload:           event.payload,
           metadata:          event.metadata,
           occurred_at:       event.occurred_at,
@@ -293,7 +294,7 @@ EventEngine::Store::Recorder.prepend(RecordDomainOnly)
 ```
 
 **Why:** keep the log focused on domain/audit-worthy events and avoid recording noisy
-level-1 system pings.
+system events.
 
 ### Replacing the recorder entirely
 
@@ -308,7 +309,7 @@ class MyAuditRecorder
 end
 
 Rails.application.config.after_initialize do
-  EventEngine.register_handler(MyAuditRecorder.new, levels: :all)
+  EventEngine.register_handler(MyAuditRecorder.new, process_types: :all)
 end
 ```
 
@@ -362,7 +363,7 @@ log in append order (ordered by `id`, batched via `find_each`):
 
 ```ruby
 EventEngine::Store::Replay.each do |event|
-  # event is a fully-rehydrated EventEngine::Event (symbol-keyed payload)
+  # event is an EventEngine::Event rebuilt from its row
   puts "#{event.occurred_at} #{event.event_name}"
 end
 
@@ -370,6 +371,13 @@ end
 enum = EventEngine::Store::Replay.each
 enum.count
 ```
+
+A replayed event differs from the one that was dispatched:
+
+- `payload` and `metadata` have **string keys**, because they are read back from JSON
+  columns (`event.payload["weight"]`, not `event.payload[:weight]`).
+- `event_name` and `process_type` are **strings**, read back from string columns.
+- `subject` and `domain` are **nil**, because the table has no columns for them.
 
 Use replay to rebuild read models, backfill a new projection, or audit history.
 
@@ -386,7 +394,7 @@ class OrdersByDay
   attr_reader :counts
 
   def apply(event)
-    @counts[event.occurred_at.to_date] += 1 if event.event_name == :order_placed
+    @counts[event.occurred_at.to_date] += 1 if event.event_name.to_s == "order_placed"
   end
 end
 
