@@ -6,6 +6,16 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-07
+
+### Added
+
+- The gem ships its expert agents, so an app that installs it can ask an event_engine-store expert how events are stored, replayed and built into projections.
+
+### Fixed
+
+- The stored events migration runs on Rails 7.1.
+
 ## [0.1.0] - 2026-07-29
 
 First published release of `event_engine-store`, the durable event record for the
